@@ -914,13 +914,20 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 }
 
 func (c *Client) UpdateCalendarEvent(calID string, eventID string, event ical.Event, userKr openpgp.KeyRing) (*CalendarEvent, error) {
-	oldEvent, err := c.GetCalendarEvent(calID, eventID)
-	isCreate := false
-	var apiErr *APIError
-	if errors.As(err, &apiErr) && apiErr.Code == 2061 {
+	isCreate := eventID == ""
+	var oldEvent *CalendarEvent
+	if !isCreate {
+		var err error
+		oldEvent, err = c.GetCalendarEvent(calID, eventID)
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Code == 2061 {
+			isCreate = true
+		} else if err != nil {
+			return nil, fmt.Errorf("UpdateCalendarEvent: could not get old calendar event: (%w)", err)
+		}
+	}
+	if oldEvent == nil {
 		isCreate = true
-	} else if err != nil {
-		return nil, fmt.Errorf("UpdateCalendarEvent: could not get old calendar event: (%w)", err)
 	}
 
 	data, memberID, err := makeUpdateData(c, calID, oldEvent, event, userKr)
