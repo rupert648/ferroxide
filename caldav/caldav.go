@@ -24,6 +24,7 @@ type backend struct {
 	privateKeys openpgp.EntityList
 	keyCache    map[string]openpgp.EntityList
 	locker      sync.Mutex
+	username    string
 }
 
 func (b *backend) receiveEvents(events <-chan *protonmail.Event) {
@@ -186,11 +187,51 @@ func formatCalendarObjectPath(id string) string {
 }
 
 func (b *backend) CalendarHomeSetPath(ctx context.Context) (string, error) {
-	userPrincipal, err := b.CurrentUserPrincipal(ctx)
-	if err != nil {
-		return "", fmt.Errorf("caldav/CalendarHomeSetPath: could not get current user principal: (%w)", err)
+	if b.username == "" {
+		return "", fmt.Errorf("caldav/CalendarHomeSetPath: missing username")
 	}
-	return userPrincipal + "calendars/", nil
+	return "/calendars/" + b.username + "/", nil
+}
+
+func trimCalendarHome(path, homeSetPath string) (string, error) {
+	hs := strings.TrimSuffix(homeSetPath, "/")
+	p := strings.TrimSuffix(path, "/")
+	if !strings.HasPrefix(p, hs) {
+		return "", fmt.Errorf("caldav: path %s is outside home set %s", path, homeSetPath)
+	}
+	rel := strings.TrimPrefix(p, hs)
+	rel = strings.TrimPrefix(rel, "/")
+	if rel == "" {
+		return "", fmt.Errorf("caldav: empty calendar path for %s", path)
+	}
+	return rel, nil
+}
+
+func parseCalendarID(path, homeSetPath string) (string, error) {
+	rel, err := trimCalendarHome(path, homeSetPath)
+	if err != nil {
+		return "", err
+	}
+	if strings.Contains(rel, "/") {
+		return "", fmt.Errorf("caldav: invalid calendar path %s", path)
+	}
+	return rel, nil
+}
+
+func parseCalendarEventIDs(path, homeSetPath string) (string, string, error) {
+	rel, err := trimCalendarHome(path, homeSetPath)
+	if err != nil {
+		return "", "", err
+	}
+	if !strings.HasSuffix(rel, ".ics") {
+		return "", "", fmt.Errorf("caldav: invalid calendar object path %s", path)
+	}
+	rel = strings.TrimSuffix(rel, ".ics")
+	parts := strings.Split(rel, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("caldav: invalid calendar object path %s", path)
+	}
+	return parts[0], parts[1], nil
 }
 
 func (b *backend) ListCalendars(ctx context.Context) ([]caldav.Calendar, error) {
@@ -218,7 +259,7 @@ func (b *backend) ListCalendars(ctx context.Context) ([]caldav.Calendar, error) 
 		}
 
 		caldavCal := caldav.Calendar{
-			Path:        homeSetPath + cal.ID,
+			Path:        homeSetPath + cal.ID + "/",
 			Name:        calView.Name,
 			Description: calView.Description,
 		}
@@ -238,8 +279,10 @@ func (b *backend) GetCalendar(ctx context.Context, path string) (*caldav.Calenda
 		return nil, fmt.Errorf("caldav/GetCalendar: error getting calendar home set path: (%w)", err)
 	}
 
-	id, _ := strings.CutSuffix(path, "/")
-	id, _ = strings.CutPrefix(id, homeSetPath)
+	id, err := parseCalendarID(path, homeSetPath)
+	if err != nil {
+		return nil, fmt.Errorf("caldav/GetCalendar: bad path %s: (%w)", path, err)
+	}
 	for _, cal := range protonCals {
 		if cal.ID != id {
 			continue
@@ -256,7 +299,7 @@ func (b *backend) GetCalendar(ctx context.Context, path string) (*caldav.Calenda
 		}
 
 		caldavCal := caldav.Calendar{
-			Path:        homeSetPath + cal.ID,
+			Path:        homeSetPath + cal.ID + "/",
 			Name:        calView.Name,
 			Description: calView.Description,
 		}
@@ -272,15 +315,10 @@ func (b *backend) GetCalendarObject(ctx context.Context, path string, req *calda
 		return nil, fmt.Errorf("caldav/GetCalendarObject: error getting calendar home set path: (%w)", err)
 	}
 
-	calEvtId, _ := strings.CutSuffix(path, "/")
-	calEvtId, _ = strings.CutSuffix(calEvtId, ".ics")
-	calEvtId, _ = strings.CutPrefix(calEvtId, homeSetPath)
-	splitIds := strings.Split(calEvtId, "/")
-	if len(splitIds) < 2 {
-		return nil, fmt.Errorf("caldav/GetCalendarObject: bad path %s", path)
+	calId, evtId, err := parseCalendarEventIDs(path, homeSetPath)
+	if err != nil {
+		return nil, fmt.Errorf("caldav/GetCalendarObject: bad path %s: (%w)", path, err)
 	}
-
-	calId, evtId := splitIds[0], splitIds[1]
 	event, err := b.c.GetCalendarEvent(calId, evtId)
 	if err != nil {
 		return nil, fmt.Errorf("caldav/GetCalendarObject: error getting calendar event (calId: %s, evtId: %s): (%w)", calId, evtId, err)
@@ -310,8 +348,10 @@ func (b *backend) ListCalendarObjects(ctx context.Context, path string, req *cal
 		return nil, fmt.Errorf("caldav/ListCalendarObjects: error getting calendar home set path: (%w)", err)
 	}
 
-	calId, _ := strings.CutSuffix(path, "/")
-	calId, _ = strings.CutPrefix(calId, homeSetPath)
+	calId, err := parseCalendarID(path, homeSetPath)
+	if err != nil {
+		return nil, fmt.Errorf("caldav/ListCalendarObjects: bad path %s: (%w)", path, err)
+	}
 
 	events, err := b.c.ListCalendarEvents(calId, nil)
 	if err != nil {
@@ -351,8 +391,10 @@ func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *
 		return nil, fmt.Errorf("caldav/QueryCalendarObjects: error getting calendar home set path: (%w)", err)
 	}
 
-	calId, _ := strings.CutSuffix(path, "/")
-	calId, _ = strings.CutPrefix(calId, homeSetPath)
+	calId, err := parseCalendarID(path, homeSetPath)
+	if err != nil {
+		return nil, fmt.Errorf("caldav/QueryCalendarObjects: bad path %s: (%w)", path, err)
+	}
 
 	if query.CompFilter.Name != ical.CompCalendar {
 		return nil, fmt.Errorf("caldav/QueryCalendarObjects: expected top-level comp to be VCALENDAR")
@@ -404,15 +446,10 @@ func (b *backend) PutCalendarObject(ctx context.Context, path string, calendar *
 		return nil, fmt.Errorf("caldav/PutCalendarObject: error getting calendar home set path: (%w)", err)
 	}
 
-	calEvtId, _ := strings.CutSuffix(path, "/")
-	calEvtId, _ = strings.CutSuffix(calEvtId, ".ics")
-	calEvtId, _ = strings.CutPrefix(calEvtId, homeSetPath)
-	splitIds := strings.Split(calEvtId, "/")
-	if len(splitIds) < 2 {
-		return nil, fmt.Errorf("caldav/PutCalendarObject: bad path %s", path)
+	calId, evtId, err := parseCalendarEventIDs(path, homeSetPath)
+	if err != nil {
+		return nil, fmt.Errorf("caldav/PutCalendarObject: bad path %s: (%w)", path, err)
 	}
-
-	calId, evtId := splitIds[0], splitIds[1]
 
 	events := calendar.Events()
 	if len(events) != 1 {
@@ -441,15 +478,10 @@ func (b *backend) DeleteCalendarObject(ctx context.Context, path string) error {
 		return fmt.Errorf("caldav/DeleteCalendarObject: error getting calendar home set path: (%w)", err)
 	}
 
-	calEvtId, _ := strings.CutSuffix(path, "/")
-	calEvtId, _ = strings.CutSuffix(calEvtId, ".ics")
-	calEvtId, _ = strings.CutPrefix(calEvtId, homeSetPath)
-	splitIds := strings.Split(calEvtId, "/")
-	if len(splitIds) < 2 {
-		return fmt.Errorf("caldav/DeleteCalendarObject: bad path %s", path)
+	calId, evtId, err := parseCalendarEventIDs(path, homeSetPath)
+	if err != nil {
+		return fmt.Errorf("caldav/DeleteCalendarObject: bad path %s: (%w)", path, err)
 	}
-
-	calId, evtId := splitIds[0], splitIds[1]
 
 	if err := b.c.DeleteCalendarEvent(calId, evtId); err != nil {
 		return fmt.Errorf("caldav/DeleteCalendarObject: error deleting calendar event (calId: %s, evtId: %s): (%w)", calId, evtId, err)
@@ -459,7 +491,10 @@ func (b *backend) DeleteCalendarObject(ctx context.Context, path string) error {
 }
 
 func (b *backend) CurrentUserPrincipal(ctx context.Context) (string, error) {
-	return "/caldav/", nil
+	if b.username == "" {
+		return "", fmt.Errorf("caldav/CurrentUserPrincipal: missing username")
+	}
+	return "/principals/" + b.username + "/", nil
 }
 
 func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, username string, events <-chan *protonmail.Event) http.Handler {
@@ -472,6 +507,7 @@ func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, username s
 		c:           c,
 		privateKeys: privateKeys,
 		keyCache:    keyCache,
+		username:    username,
 	}
 
 	if events != nil {

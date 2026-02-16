@@ -170,10 +170,32 @@ func listenAndServeIMAP(addr string, debug bool, authManager *auth.Manager, even
 func listenAndServeCalDAV(addr string, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
 	handlers := make(map[string]http.Handler)
 
+	rewriteCalDAVPath := func(req *http.Request) {
+		p := req.URL.Path
+		switch {
+		case p == "/.well-known/caldav" || p == "/.well-known/caldav/":
+			p = "/"
+		case p == "/caldav" || p == "/caldav/":
+			p = "/"
+		case strings.HasPrefix(p, "/caldav/"):
+			p = strings.TrimPrefix(p, "/caldav")
+		}
+		if p != req.URL.Path {
+			req.URL.Path = p
+			req.URL.RawPath = p
+			if req.URL.RawQuery != "" {
+				req.RequestURI = p + "?" + req.URL.RawQuery
+			} else {
+				req.RequestURI = p
+			}
+		}
+	}
+
 	s := &http.Server{
 		Addr:      addr,
 		TLSConfig: tlsConfig,
 		Handler: http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+			rewriteCalDAVPath(req)
 			resp.Header().Set("WWW-Authenticate", "Basic")
 
 			username, password, ok := req.BasicAuth()
