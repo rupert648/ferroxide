@@ -174,11 +174,9 @@ func listenAndServeCalDAV(addr string, authManager *auth.Manager, eventsManager 
 		p := req.URL.Path
 		switch {
 		case p == "/.well-known/caldav" || p == "/.well-known/caldav/":
-			p = "/"
+			p = "/caldav/"
 		case p == "/caldav" || p == "/caldav/":
-			p = "/"
-		case strings.HasPrefix(p, "/caldav/"):
-			p = strings.TrimPrefix(p, "/caldav")
+			p = "/caldav/"
 		}
 		if p != req.URL.Path {
 			req.URL.Path = p

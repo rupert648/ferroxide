@@ -16,6 +16,7 @@ import (
 	"github.com/acheong08/ferroxide/protonmail"
 	"github.com/acheong08/ferroxide/utils"
 	"github.com/emersion/go-ical"
+	"github.com/emersion/go-webdav"
 	"github.com/emersion/go-webdav/caldav"
 )
 
@@ -25,6 +26,7 @@ type backend struct {
 	keyCache    map[string]openpgp.EntityList
 	locker      sync.Mutex
 	username    string
+	uidToID     map[string]string
 }
 
 func (b *backend) receiveEvents(events <-chan *protonmail.Event) {
@@ -116,6 +118,14 @@ func toIcalCalendar(event *protonmail.CalendarEvent, userKr openpgp.KeyRing, cal
 		merged.Children = append(merged.Children, alarm)
 	}
 
+	// Preserve the VEVENT UID when present; some clients (e.g. Apple Calendar) use it
+	// as the resource identifier. Fall back to the Proton event ID only if missing.
+	if event.UID != "" {
+		merged.Props.SetText("UID", event.UID)
+	} else if uidProp := merged.Props.Get("UID"); uidProp == nil || uidProp.Value == "" {
+		merged.Props.SetText("UID", event.ID)
+	}
+
 	cal := ical.NewCalendar()
 
 	utils.MapCopy(cal.Props, calProps)
@@ -125,34 +135,32 @@ func toIcalCalendar(event *protonmail.CalendarEvent, userKr openpgp.KeyRing, cal
 }
 
 func getCalendarObject(b *backend, calId string, calKr openpgp.KeyRing, event *protonmail.CalendarEvent, settings protonmail.CalendarSettings) (*caldav.CalendarObject, error) {
-	var userKr openpgp.EntityList
-
-	// Handle empty author (e.g., birthday calendars, imported events)
-	// Fall back to user's own keys for signature verification
-	if event.Author == "" {
-		userKr = b.privateKeys
-	} else {
-		var exists bool
-		userKr, exists = b.keyCache[event.Author]
-		if !exists {
-			userKeys, err := b.c.GetPublicKeys(event.Author)
-			if err != nil {
-				return nil, fmt.Errorf("caldav/getCalendarObject: could not get public keys for author %s: (%w)", event.Author, err)
-			}
-
-			for _, userKey := range userKeys.Keys {
-				userKeyEntity, err := userKey.Entity()
-				if err != nil {
-					return nil, fmt.Errorf("caldav/getCalendarObject: error converting user key entity: (%w)", err)
-				}
-
-				userKr = append(userKr, userKeyEntity)
-			}
-
-			b.locker.Lock()
-			b.keyCache[event.Author] = userKr
-			b.locker.Unlock()
+	author := event.Author
+	if author == "" {
+		author = b.username
+	}
+	userKr, exists := b.keyCache[author]
+	if !exists {
+		if author == "" {
+			return nil, fmt.Errorf("caldav/getCalendarObject: missing author email for event %s", event.ID)
 		}
+		userKeys, err := b.c.GetPublicKeys(author)
+		if err != nil {
+			return nil, fmt.Errorf("caldav/getCalendarObject: could not get public keys for author %s: (%w)", author, err)
+		}
+
+		for _, userKey := range userKeys.Keys {
+			userKeyEntity, err := userKey.Entity()
+			if err != nil {
+				return nil, fmt.Errorf("caldav/getCalendarObject: error converting user key entity: (%w)", err)
+			}
+
+			userKr = append(userKr, userKeyEntity)
+		}
+
+		b.locker.Lock()
+		b.keyCache[author] = userKr
+		b.locker.Unlock()
 	}
 
 	if event.Notifications == nil {
@@ -173,12 +181,24 @@ func getCalendarObject(b *backend, calId string, calKr openpgp.KeyRing, event *p
 		return nil, fmt.Errorf("caldav/getCalendarObject: error getting calendar home set path: (%w)", err)
 	}
 
+	resourceID := event.ID
+	if event.UID != "" {
+		resourceID = event.UID
+	}
 	co := &caldav.CalendarObject{
-		Path:    homeSetPath + calId + formatCalendarObjectPath(event.ID),
+		Path:    homeSetPath + calId + formatCalendarObjectPath(resourceID),
 		ModTime: time.Unix(int64(event.LastEditTime), 0),
 		ETag:    fmt.Sprintf("%X%s", event.LastEditTime, event.ID),
 		Data:    data,
 	}
+	b.locker.Lock()
+	if event.ID != "" {
+		b.uidToID[event.ID] = event.ID
+	}
+	if event.UID != "" {
+		b.uidToID[event.UID] = event.ID
+	}
+	b.locker.Unlock()
 	return co, nil
 }
 
@@ -187,10 +207,11 @@ func formatCalendarObjectPath(id string) string {
 }
 
 func (b *backend) CalendarHomeSetPath(ctx context.Context) (string, error) {
-	if b.username == "" {
-		return "", fmt.Errorf("caldav/CalendarHomeSetPath: missing username")
+	userPrincipal, err := b.CurrentUserPrincipal(ctx)
+	if err != nil {
+		return "", fmt.Errorf("caldav/CalendarHomeSetPath: could not get current user principal: (%w)", err)
 	}
-	return "/calendars/" + b.username + "/", nil
+	return userPrincipal + "calendars/", nil
 }
 
 func trimCalendarHome(path, homeSetPath string) (string, error) {
@@ -259,7 +280,7 @@ func (b *backend) ListCalendars(ctx context.Context) ([]caldav.Calendar, error) 
 		}
 
 		caldavCal := caldav.Calendar{
-			Path:        homeSetPath + cal.ID + "/",
+			Path:        homeSetPath + cal.ID,
 			Name:        calView.Name,
 			Description: calView.Description,
 		}
@@ -299,7 +320,7 @@ func (b *backend) GetCalendar(ctx context.Context, path string) (*caldav.Calenda
 		}
 
 		caldavCal := caldav.Calendar{
-			Path:        homeSetPath + cal.ID + "/",
+			Path:        homeSetPath + cal.ID,
 			Name:        calView.Name,
 			Description: calView.Description,
 		}
@@ -319,7 +340,34 @@ func (b *backend) GetCalendarObject(ctx context.Context, path string, req *calda
 	if err != nil {
 		return nil, fmt.Errorf("caldav/GetCalendarObject: bad path %s: (%w)", path, err)
 	}
+	if b.c != nil && b.c.Debug {
+		log.Printf("caldav/GetCalendarObject: raw path=%s calId=%s evtId=%s", path, calId, evtId)
+	}
+	if resolved, ok := resolveEventIDFromCache(b, evtId); ok {
+		if b.c != nil && b.c.Debug {
+			log.Printf("caldav/GetCalendarObject: cache hit evtId=%s -> %s", evtId, resolved)
+		}
+		evtId = resolved
+	} else if isLikelyUUID(evtId) {
+		if b.c != nil && b.c.Debug {
+			log.Printf("caldav/GetCalendarObject: evtId looks like UUID, attempting UID resolve: %s", evtId)
+		}
+		if resolved, resErr := resolveEventIDByUID(b, calId, evtId); resErr == nil {
+			if b.c != nil && b.c.Debug {
+				log.Printf("caldav/GetCalendarObject: UID resolve success evtId=%s -> %s", evtId, resolved)
+			}
+			evtId = resolved
+		} else {
+			if b.c != nil && b.c.Debug {
+				log.Printf("caldav/GetCalendarObject: UID resolve failed evtId=%s err=%v", evtId, resErr)
+			}
+			return nil, webdav.NewHTTPError(http.StatusNotFound, errors.New("calendar event not found"))
+		}
+	}
 	event, err := b.c.GetCalendarEvent(calId, evtId)
+	if apiErr, ok := err.(*protonmail.APIError); ok && apiErr.Code == 2061 {
+		return nil, webdav.NewHTTPError(http.StatusNotFound, errors.New("calendar event not found"))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("caldav/GetCalendarObject: error getting calendar event (calId: %s, evtId: %s): (%w)", calId, evtId, err)
 	}
@@ -450,6 +498,7 @@ func (b *backend) PutCalendarObject(ctx context.Context, path string, calendar *
 	if err != nil {
 		return nil, fmt.Errorf("caldav/PutCalendarObject: bad path %s: (%w)", path, err)
 	}
+	reqResourceID := evtId
 
 	events := calendar.Events()
 	if len(events) != 1 {
@@ -457,13 +506,53 @@ func (b *backend) PutCalendarObject(ctx context.Context, path string, calendar *
 	}
 	event := events[0]
 
+	clientUID := ""
+	if uidProp := event.Props.Get("UID"); uidProp != nil {
+		clientUID = uidProp.Value
+	}
+	if clientUID == "" && evtId != "" {
+		// Preserve client-chosen resource IDs as UID when possible.
+		event.Props.SetText("UID", evtId)
+		clientUID = evtId
+	}
+	if resolved, resErr := resolveEventIDByUID(b, calId, evtId); resErr == nil {
+		evtId = resolved
+	} else if isLikelyUUID(evtId) {
+		// Treat unknown UUID resource IDs as creates; avoid passing invalid IDs to Proton.
+		evtId = ""
+	}
+
 	newEvent, err := b.c.UpdateCalendarEvent(calId, evtId, event, b.privateKeys)
 	if err != nil {
 		log.Printf("caldav/PutCalendarObject: failed (calId: %s, evtId: %s): %v", calId, evtId, err)
 		return nil, fmt.Errorf("caldav/PutCalendarObject: error updating calendar event (calId: %s, evtId: %s): (%w)", calId, evtId, err)
 	}
 
-	path = homeSetPath + calId + formatCalendarObjectPath(newEvent.ID)
+	resourceID := reqResourceID
+	if resourceID == "" {
+		resourceID = clientUID
+	}
+	if resourceID == "" {
+		resourceID = newEvent.UID
+	}
+	if resourceID == "" {
+		resourceID = newEvent.ID
+	}
+	path = homeSetPath + calId + formatCalendarObjectPath(resourceID)
+	b.locker.Lock()
+	if newEvent.ID != "" {
+		b.uidToID[newEvent.ID] = newEvent.ID
+	}
+	if newEvent.UID != "" {
+		b.uidToID[newEvent.UID] = newEvent.ID
+	}
+	if clientUID != "" {
+		b.uidToID[clientUID] = newEvent.ID
+	}
+	if evtId != "" && evtId != newEvent.ID {
+		b.uidToID[evtId] = newEvent.ID
+	}
+	b.locker.Unlock()
 
 	return &caldav.CalendarObject{
 		Path:    path,
@@ -483,6 +572,9 @@ func (b *backend) DeleteCalendarObject(ctx context.Context, path string) error {
 		return fmt.Errorf("caldav/DeleteCalendarObject: bad path %s: (%w)", path, err)
 	}
 
+	if resolved, resErr := resolveEventIDByUID(b, calId, evtId); resErr == nil {
+		evtId = resolved
+	}
 	if err := b.c.DeleteCalendarEvent(calId, evtId); err != nil {
 		return fmt.Errorf("caldav/DeleteCalendarObject: error deleting calendar event (calId: %s, evtId: %s): (%w)", calId, evtId, err)
 	}
@@ -491,10 +583,80 @@ func (b *backend) DeleteCalendarObject(ctx context.Context, path string) error {
 }
 
 func (b *backend) CurrentUserPrincipal(ctx context.Context) (string, error) {
-	if b.username == "" {
-		return "", fmt.Errorf("caldav/CurrentUserPrincipal: missing username")
+	return "/caldav/", nil
+}
+
+func resolveEventIDFromCache(b *backend, uid string) (string, bool) {
+	b.locker.Lock()
+	id, ok := b.uidToID[uid]
+	b.locker.Unlock()
+	return id, ok
+}
+
+func resolveEventIDByUID(b *backend, calID string, uid string) (string, error) {
+	if uid == "" {
+		return "", fmt.Errorf("empty uid")
 	}
-	return "/principals/" + b.username + "/", nil
+	b.locker.Lock()
+	if resolved, ok := b.uidToID[uid]; ok {
+		b.locker.Unlock()
+		if b.c != nil && b.c.Debug {
+			log.Printf("caldav/resolveEventIDByUID: cache hit uid=%s -> %s", uid, resolved)
+		}
+		return resolved, nil
+	}
+	b.locker.Unlock()
+	events, err := b.c.ListCalendarEvents(calID, nil)
+	if err != nil {
+		return "", err
+	}
+	if b.c != nil && b.c.Debug {
+		log.Printf("caldav/resolveEventIDByUID: scanning %d events for uid=%s", len(events), uid)
+	}
+	for _, event := range events {
+		if event.ID == uid {
+			if b.c != nil && b.c.Debug {
+				log.Printf("caldav/resolveEventIDByUID: uid matches event ID %s", event.ID)
+			}
+			return event.ID, nil
+		}
+		if event.UID != "" && strings.EqualFold(event.UID, uid) {
+			b.locker.Lock()
+			b.uidToID[uid] = event.ID
+			b.locker.Unlock()
+			if b.c != nil && b.c.Debug {
+				log.Printf("caldav/resolveEventIDByUID: uid matches event.UID %s -> %s", event.UID, event.ID)
+			}
+			return event.ID, nil
+		}
+	}
+	for _, event := range events {
+		full, err := b.c.GetCalendarEvent(calID, event.ID)
+		if err != nil {
+			continue
+		}
+		if full.UID != "" && strings.EqualFold(full.UID, uid) {
+			b.locker.Lock()
+			b.uidToID[uid] = full.ID
+			b.locker.Unlock()
+			if b.c != nil && b.c.Debug {
+				log.Printf("caldav/resolveEventIDByUID: uid matches full.UID %s -> %s", full.UID, full.ID)
+			}
+			return full.ID, nil
+		}
+	}
+	return "", fmt.Errorf("event not found for uid %s", uid)
+}
+
+func isLikelyUUID(id string) bool {
+	// Simple UUID v4 shape check: 36 chars with hyphens at 8-13-18-23
+	if len(id) != 36 {
+		return false
+	}
+	if id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+		return false
+	}
+	return true
 }
 
 func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, username string, events <-chan *protonmail.Event) http.Handler {
@@ -508,6 +670,7 @@ func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, username s
 		privateKeys: privateKeys,
 		keyCache:    keyCache,
 		username:    username,
+		uidToID:     make(map[string]string),
 	}
 
 	if events != nil {
