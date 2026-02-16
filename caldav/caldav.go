@@ -18,6 +18,7 @@ import (
 	"github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav"
 	"github.com/emersion/go-webdav/caldav"
+	"github.com/google/uuid"
 )
 
 type backend struct {
@@ -34,8 +35,7 @@ func (b *backend) receiveEvents(events <-chan *protonmail.Event) {
 }
 
 func (b *backend) CreateCalendar(ctx context.Context, calendar *caldav.Calendar) error {
-	// TODO: CreateCalendar
-	return errors.ErrUnsupported
+	return webdav.NewHTTPError(http.StatusForbidden, errors.New("cannot create new calendar"))
 }
 
 func readEventCard(event *ical.Event, eventCard protonmail.CalendarEventCard, userKr openpgp.KeyRing, calKr openpgp.KeyRing, keyPacket string) (ical.Props, error) {
@@ -659,6 +659,83 @@ func isLikelyUUID(id string) bool {
 	return true
 }
 
+func resourceIDFromCalendar(cal *ical.Calendar) string {
+	if cal != nil {
+		events := cal.Events()
+		if len(events) == 1 {
+			if uidProp := events[0].Props.Get("UID"); uidProp != nil && uidProp.Value != "" {
+				return uidProp.Value
+			}
+		}
+	}
+	return uuid.NewString()
+}
+
+type handler struct {
+	backend *backend
+	inner   *caldav.Handler
+}
+
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		if h.handlePost(w, r) {
+			return
+		}
+	}
+	h.inner.ServeHTTP(w, r)
+}
+
+func (h *handler) handlePost(w http.ResponseWriter, r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/calendar") {
+		return false
+	}
+
+	if strings.HasSuffix(r.URL.Path, ".ics") {
+		return false
+	}
+
+	homeSetPath, err := h.backend.CalendarHomeSetPath(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return true
+	}
+
+	calID, err := parseCalendarID(r.URL.Path, homeSetPath)
+	if err != nil {
+		return false
+	}
+
+	cal, err := ical.NewDecoder(r.Body).Decode()
+	if err != nil {
+		http.Error(w, "invalid calendar data", http.StatusBadRequest)
+		return true
+	}
+
+	resourceID := resourceIDFromCalendar(cal)
+	if events := cal.Events(); len(events) == 1 {
+		if uidProp := events[0].Props.Get("UID"); uidProp == nil || uidProp.Value == "" {
+			events[0].Props.SetText("UID", resourceID)
+		}
+	}
+
+	path := homeSetPath + calID + formatCalendarObjectPath(resourceID)
+	loc, err := h.backend.PutCalendarObject(r.Context(), path, cal, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return true
+	}
+
+	if loc != nil {
+		w.Header().Set("Location", loc.Path)
+		if loc.ETag != "" {
+			w.Header().Set("ETag", loc.ETag)
+		}
+	}
+	w.WriteHeader(http.StatusCreated)
+	return true
+}
+
 func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, username string, events <-chan *protonmail.Event) http.Handler {
 	if len(privateKeys) == 0 {
 		panic("ferroxide/caldav: no private key available")
@@ -677,5 +754,8 @@ func NewHandler(c *protonmail.Client, privateKeys openpgp.EntityList, username s
 		go b.receiveEvents(events)
 	}
 
-	return &caldav.Handler{Backend: b}
+	return &handler{
+		backend: b,
+		inner:   &caldav.Handler{Backend: b},
+	}
 }
